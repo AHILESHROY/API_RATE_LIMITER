@@ -1,5 +1,4 @@
-
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, g
 from google.cloud import firestore
 from datetime import datetime, timezone
 import os
@@ -21,6 +20,11 @@ PROJECT_ID = os.getenv(
     "api-rate-limiting"
 )
 
+DATABASE_ID = os.getenv(
+    "FIRESTORE_DATABASE_ID",
+    "api-rate-limiter-db"
+)
+
 VALID_API_KEYS = {
     key.strip()
     for key in os.getenv(
@@ -30,20 +34,15 @@ VALID_API_KEYS = {
     if key.strip()
 }
 
-# Local development uses Application Default Credentials.
-# Cloud Run uses its attached service account.
-DATABASE_ID = os.getenv("FIRESTORE_DATABASE_ID", "api-rate-limiter-db")
-
 db = firestore.Client(
     project=PROJECT_ID,
     database=DATABASE_ID
 )
 
 
-def document_id(*parts):
-    """Return a deterministic, safe Firestore document ID."""
-    raw = "|".join(parts)
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+def hash_value(value):
+    """Return a SHA-256 hash without storing a raw API key."""
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
 # ==========================================
@@ -51,7 +50,9 @@ def document_id(*parts):
 # ==========================================
 
 def check_rate_limit(api_key, endpoint):
-    bucket_id = document_id(api_key, endpoint)
+    # Separate rate-limit buckets by API key and endpoint.
+    bucket_id = hash_value(f"{api_key}|{endpoint}")
+
     bucket_ref = (
         db.collection("rate_limit_buckets")
         .document(bucket_id)
@@ -63,14 +64,19 @@ def check_rate_limit(api_key, endpoint):
         now = time.time()
 
         if snapshot.exists:
-            data = snapshot.to_dict()
-            tokens = float(data.get("tokens", BUCKET_CAPACITY))
-            last_refill = float(data.get("last_refill", now))
+            data = snapshot.to_dict() or {}
+            tokens = float(
+                data.get("tokens", BUCKET_CAPACITY)
+            )
+            last_refill = float(
+                data.get("last_refill", now)
+            )
         else:
             tokens = float(BUCKET_CAPACITY)
             last_refill = now
 
         elapsed = max(0.0, now - last_refill)
+
         tokens = min(
             float(BUCKET_CAPACITY),
             tokens + elapsed * REFILL_RATE
@@ -102,11 +108,13 @@ def check_rate_limit(api_key, endpoint):
 
 @app.before_request
 def authenticate_and_limit():
-    request.start_time = time.time()
+    g.request_start_time = time.time()
 
+    # Public health endpoint.
     if request.path == "/health":
         return None
 
+    # Only configured API keys are accepted.
     api_key = request.headers.get("X-API-Key")
 
     if not api_key or api_key not in VALID_API_KEYS:
@@ -114,7 +122,8 @@ def authenticate_and_limit():
             "error": "Missing or invalid API key"
         }), 401
 
-    request.api_key = api_key
+    g.api_key = api_key
+    g.api_key_hash = hash_value(api_key)
 
     try:
         allowed, remaining, retry_after = check_rate_limit(
@@ -122,33 +131,42 @@ def authenticate_and_limit():
             request.path
         )
     except Exception:
-        app.logger.exception("Firestore rate-limit operation failed")
+        app.logger.exception(
+            "Firestore rate-limit operation failed"
+        )
         return jsonify({
             "error": "Rate-limiting service temporarily unavailable"
         }), 503
 
-    request.remaining_tokens = remaining
+    g.remaining_tokens = max(0, int(remaining))
 
     if not allowed:
+        g.rate_limited = True
+
         response = jsonify({
             "error": "Rate limit exceeded",
             "algorithm": "Token Bucket",
             "bucket_capacity": BUCKET_CAPACITY,
             "retry_after_seconds": round(retry_after, 2)
         })
+
         response.status_code = 429
         response.headers["Retry-After"] = str(
             max(1, math.ceil(retry_after))
         )
-        response.headers["X-RateLimit-Limit"] = str(BUCKET_CAPACITY)
+        response.headers["X-RateLimit-Limit"] = str(
+            BUCKET_CAPACITY
+        )
         response.headers["X-RateLimit-Remaining"] = "0"
+
         return response
 
+    g.rate_limited = False
     return None
 
 
 # ==========================================
-# USAGE ANALYTICS
+# REQUEST ANALYTICS
 # ==========================================
 
 @app.after_request
@@ -156,17 +174,14 @@ def record_request(response):
     if request.path == "/health":
         return response
 
-    api_key = getattr(request, "api_key", None)
+    api_key_hash = getattr(g, "api_key_hash", None)
 
-    if api_key:
+    # Record analytics only after successful API-key validation.
+    if api_key_hash:
         elapsed_ms = round(
-            (time.time() - request.start_time) * 1000,
+            (time.time() - g.request_start_time) * 1000,
             2
         )
-
-        api_key_hash = hashlib.sha256(
-            api_key.encode("utf-8")
-        ).hexdigest()
 
         try:
             db.collection("api_analytics").add({
@@ -174,14 +189,26 @@ def record_request(response):
                 "endpoint": request.path,
                 "status_code": response.status_code,
                 "response_time_ms": elapsed_ms,
-                "timestamp": datetime.now(timezone.utc).isoformat()
+                "timestamp": datetime.now(
+                    timezone.utc
+                ).isoformat()
             })
         except Exception:
-            app.logger.exception("Failed to record analytics")
+            # Analytics failure is logged without replacing
+            # the original API response.
+            app.logger.exception(
+                "Failed to record analytics"
+            )
 
-        response.headers["X-RateLimit-Limit"] = str(BUCKET_CAPACITY)
+        response.headers["X-RateLimit-Limit"] = str(
+            BUCKET_CAPACITY
+        )
+
+        remaining = getattr(g, "remaining_tokens", 0)
+
         response.headers["X-RateLimit-Remaining"] = str(
-            max(0, int(getattr(request, "remaining_tokens", 0)))
+            0 if response.status_code == 429
+            else max(0, int(remaining))
         )
 
     return response
@@ -210,14 +237,16 @@ def get_data():
 
 @app.route("/api/v1/analytics", methods=["GET"])
 def get_analytics():
-    api_key_hash = hashlib.sha256(
-        request.api_key.encode("utf-8")
-    ).hexdigest()
+    api_key_hash = g.api_key_hash
 
     try:
         query = (
             db.collection("api_analytics")
-            .where("api_key_hash", "==", api_key_hash)
+            .where(
+                "api_key_hash",
+                "==",
+                api_key_hash
+            )
             .order_by(
                 "timestamp",
                 direction=firestore.Query.DESCENDING
@@ -238,7 +267,10 @@ def get_analytics():
         }), 200
 
     except Exception:
-        app.logger.exception("Failed to retrieve analytics")
+        app.logger.exception(
+            "Failed to retrieve analytics"
+        )
+
         return jsonify({
             "error": "Analytics service temporarily unavailable"
         }), 503
